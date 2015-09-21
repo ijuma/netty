@@ -19,6 +19,7 @@ import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.buffer.UnpooledByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerAdapter;
@@ -29,6 +30,8 @@ import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
+import io.netty.handler.ssl.util.SelfSignedCertificate;
 import io.netty.util.NetUtil;
 import io.netty.util.concurrent.Future;
 import org.junit.After;
@@ -39,14 +42,17 @@ import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 
 import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLHandshakeException;
 import java.io.File;
 import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+import static javax.net.ssl.SSLEngineResult.HandshakeStatus;
 import static org.junit.Assert.*;
 import static org.mockito.Mockito.verify;
 
@@ -163,6 +169,110 @@ public abstract class SSLEngineTest {
                           clientCrtFile, clientKeyFile, clientCrtFile, clientKeyPassword);
         assertTrue(clientLatch.await(2, TimeUnit.SECONDS));
         assertTrue(clientException instanceof SSLHandshakeException);
+    }
+
+    @Test
+    public void testWrapWrapUnwrap() throws Exception {
+        final SslContext clientContext = SslContextBuilder.forClient()
+                .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                .sslProvider(sslProvider())
+                .build();
+        SelfSignedCertificate ssc = new SelfSignedCertificate();
+        SslContext serverContext = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
+                .sslProvider(sslProvider())
+                .build();
+        SSLEngine clientEngine = clientContext.newEngine(UnpooledByteBufAllocator.DEFAULT);
+        SSLEngine serverEngine = serverContext.newEngine(UnpooledByteBufAllocator.DEFAULT);
+
+        int netBufferSize = 17 * 1024;
+        ByteBuffer cTOs = ByteBuffer.allocateDirect(netBufferSize);
+        ByteBuffer sTOc = ByteBuffer.allocateDirect(netBufferSize);
+
+        ByteBuffer serverAppReadBuffer = ByteBuffer.allocateDirect(serverEngine.getSession().getApplicationBufferSize());
+        ByteBuffer clientAppReadBuffer = ByteBuffer.allocateDirect(clientEngine.getSession().getApplicationBufferSize());
+
+        ByteBuffer serverOut = ByteBuffer.wrap("Some data".getBytes());
+        ByteBuffer serverOut2 = ByteBuffer.wrap("More data!".getBytes());
+        ByteBuffer combinedServerOut = ByteBuffer.allocateDirect(serverOut.limit() + serverOut2.limit());
+        combinedServerOut.put(serverOut);
+        combinedServerOut.put(serverOut2);
+        serverOut.clear();
+        serverOut2.clear();
+
+        ByteBuffer clientIn = ByteBuffer.allocateDirect(combinedServerOut.limit() + 50);
+
+        clientEngine.beginHandshake();
+        serverEngine.beginHandshake();
+
+        ByteBuffer empty = ByteBuffer.allocate(0);
+
+        SSLEngineResult result;
+        //handshake
+        do {
+            result = clientEngine.wrap(empty, cTOs);
+            runDelegatedTasks(result, clientEngine);
+            result = serverEngine.wrap(empty, sTOc);
+            runDelegatedTasks(result, serverEngine);
+            cTOs.flip();
+            sTOc.flip();
+            result = clientEngine.unwrap(sTOc, clientAppReadBuffer);
+            runDelegatedTasks(result, clientEngine);
+            result = serverEngine.unwrap(cTOs, serverAppReadBuffer);
+            runDelegatedTasks(result, serverEngine);
+            cTOs.compact();
+            sTOc.compact();
+        } while (isHandshaking(result) && isHandshaking(result));
+
+        serverEngine.wrap(serverOut, sTOc);
+        int positionAfterFirstWrap = sTOc.position();
+        serverEngine.wrap(serverOut2, sTOc);
+        int positionAfterSecondWrap = sTOc.position();
+        sTOc.flip();
+
+        clientEngine.unwrap(sTOc, clientIn);
+        // If we only consume the bytes for one record (like the JDK's `SSLEngineImpl` does), we need to call `unwrap`
+        // again. If we consume the bytes for both records (like OpenSslEngine does), we don't call `unwrap` a second
+        // time to verify that we produce the same number of records that we consume
+        // (see https://github.com/netty/netty/issues/4238)
+        if (sTOc.position() == positionAfterFirstWrap) {
+            clientEngine.unwrap(sTOc, clientIn);
+        }
+        assertEquals(positionAfterSecondWrap, sTOc.position());
+
+        checkTransfer(combinedServerOut, clientIn);
+
+        clientEngine.closeOutbound();
+        serverEngine.closeOutbound();
+    }
+
+    private boolean isHandshaking(SSLEngineResult result) {
+        return result.getHandshakeStatus() != HandshakeStatus.NOT_HANDSHAKING &&
+                result.getHandshakeStatus() != HandshakeStatus.FINISHED;
+    }
+
+    private static void checkTransfer(ByteBuffer a, ByteBuffer b)
+            throws Exception {
+        a.flip();
+        b.flip();
+        assertEquals(a, b);
+        a.position(a.limit());
+        b.position(b.limit());
+        a.limit(a.capacity());
+        b.limit(b.capacity());
+    }
+
+    private static void runDelegatedTasks(SSLEngineResult result,
+                                          SSLEngine engine) throws Exception {
+        if (result.getHandshakeStatus() == HandshakeStatus.NEED_TASK) {
+            Runnable runnable;
+            while ((runnable = engine.getDelegatedTask()) != null) {
+                runnable.run();
+            }
+            HandshakeStatus hsStatus = engine.getHandshakeStatus();
+            if (hsStatus == HandshakeStatus.NEED_TASK) {
+                throw new Exception("handshake shouldn't need additional tasks");
+            }
+        }
     }
 
     private void mySetupMutualAuth(File keyFile, File crtFile, String keyPassword)

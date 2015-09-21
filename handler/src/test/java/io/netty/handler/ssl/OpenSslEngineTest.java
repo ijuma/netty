@@ -43,6 +43,12 @@ public class OpenSslEngineTest extends SSLEngineTest {
     }
 
     @Override
+    public void testWrapWrapUnwrap() throws Exception {
+        assumeTrue(OpenSsl.isAvailable());
+        super.testWrapWrapUnwrap();
+    }
+
+    @Override
     protected SslProvider sslProvider() {
         return SslProvider.OPENSSL;
     }
